@@ -8,7 +8,7 @@ load_dotenv()
 class OllamaRouter:
     def __init__(self):
         self.base_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-        self.model = os.getenv("LOGRESP_MODEL", "qwen2.5:latest")
+        self.model = os.getenv("LOGRESP_MODEL", "qwen3.8:27b")
         self.chat_endpoint = f"{self.base_url}/api/chat"
         
     def generate_response(self, system_prompt, user_prompt, require_json=False):

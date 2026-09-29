@@ -53,10 +53,10 @@ from utils.severity_calculator import calculate_severity
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-OLLAMA_MODEL                   = "qwen2.5:latest"
-OLLAMA_URL                     = "http://localhost:11434/api/chat"
+OLLAMA_MODEL                   = os.getenv("LOGRESP_MODEL", "qwen3.8:27b")
+OLLAMA_URL                     = os.getenv("OLLAMA_URL", "http://localhost:11434") + "/api/chat" if not os.getenv("OLLAMA_URL", "").endswith("/api/chat") else os.getenv("OLLAMA_URL")
 CONFIDENCE_MALICIOUS_THRESHOLD = 0.75   # θ_m
-CONFIDENCE_BENIGN_THRESHOLD    = 0.95   # θ_b
+CONFIDENCE_BENIGN_THRESHOLD    = 0.85   # θ_b  (was 0.95 — too strict, caused over-investigation)
 MAX_TOOL_CALLS                 = 10     # hard limit per investigation
 MAX_REPRIMANDS_PER_CYCLE       = 3      # safety valve for reprimand loop
 
@@ -519,7 +519,8 @@ class LogMendAgent:
             self._extract_severity_inputs(observations)
         )
         severity_metrics = calculate_severity(
-            anomaly_score, features, dataset_tag, severity_ctx
+            anomaly_score, features, dataset_tag, severity_ctx,
+            process_name=record.get("processName", ""),
         )
 
         # ── Generate final structured report ─────────────────────────────────
@@ -779,6 +780,23 @@ class LogMendAgent:
                     ctx["ttp_id"]           = d["ttp_id"]
                     ctx["ttp_impact"]       = int(d.get("ttp_impact", 1))
                     ctx["kill_chain_stage"] = int(d.get("kill_chain_stage", 1))
+
+        # P2: Pass evil_ratio from features so severity calibration logic works
+        ctx["evil_ratio"] = float(features.get("evil_ratio", 0.0))
+
+        # P2: Detect if all graph-dependent tools failed (test data not in Neo4j)
+        graph_tools = {"ContextRetriever", "DescriptionGenerator", "TTPMapper"}
+        graph_statuses = []
+        for obs in observations:
+            if obs["tool"] in graph_tools:
+                try:
+                    d = json.loads(obs["result"])
+                    graph_statuses.append(d.get("status") == "success")
+                except (json.JSONDecodeError, TypeError):
+                    graph_statuses.append(False)
+        ctx["graph_tools_all_failed"] = (
+            len(graph_statuses) > 0 and not any(graph_statuses)
+        )
 
         return anomaly_score, features, ctx
 

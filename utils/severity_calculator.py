@@ -37,6 +37,21 @@ Thresholds
 
 import math
 
+# ── P3: Known-benign process dampening ────────────────────────────────────────
+# Common system daemons that run as root with high event counts.
+# When process name matches AND no rules matched AND no C2 connection,
+# the impact score is halved to prevent false positives from inflated
+# root_bonus + blast_radius on normal system processes.
+KNOWN_BENIGN_PROCESSES = frozenset({
+    "systemd", "systemd-logind", "systemd-journald", "systemd-udevd",
+    "systemd-resolve", "systemd-timesyn", "systemd-network",
+    "dbus-daemon", "sshd", "cron", "rsyslogd", "dhclient", "agetty",
+    "amazon-ssm-agen", "ssm-agent-worke", "kworker/dying",
+    "containerd", "containerd-shim", "dockerd", "docker",
+    "snapd", "polkitd", "accounts-daemon", "networkd-dispat",
+    "multipathd", "irqbalance", "atd",
+})
+
 # ── Kill-chain stage map (DARPA only) ─────────────────────────────────────────
 # Maps TTP ID → position on the 7-stage kill chain.
 # Higher stage = deeper compromise = more severe.
@@ -74,6 +89,7 @@ def calculate_severity(
     features: dict,
     dataset_tag: str,
     context: dict | None = None,
+    process_name: str = "",
 ) -> dict:
     """
     Parameters
@@ -88,6 +104,7 @@ def calculate_severity(
         ttp_id            : str    (from TTPMapper)
         ttp_impact        : int    (from TTPMapper, 1-5)
         kill_chain_stage  : int    (from TTPMapper, 1-7)
+    process_name  : str   (for P3 benign process dampening)
     """
     if context is None:
         context = {}
@@ -98,6 +115,15 @@ def calculate_severity(
         impact = _beth_impact(features, context)
     else:
         impact = _darpa_impact(features, context)
+
+    # P3: Dampen impact for known-benign system daemons when no corroborating
+    # evidence of malice exists (no rules matched, no C2 connection).
+    pname = (process_name or "").strip().lower()
+    if pname in KNOWN_BENIGN_PROCESSES:
+        no_rules = not context.get("rules_matched")
+        no_c2    = not context.get("has_c2_connection") and not context.get("c2_match")
+        if no_rules and no_c2:
+            impact *= 0.5
 
     # α=0.60 weights likelihood; β=0.40 weights impact.
     # Additive so a high ML score always contributes — never suppressed

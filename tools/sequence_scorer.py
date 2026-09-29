@@ -57,6 +57,163 @@ from database.neo4j_router import db_router
 
 MODELS_DIR = "models/saved_models"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBGRAPH QUERIES — extract k-hop neighbourhood for GNN inference
+# Training used full graph; inference must pass real neighbours or models
+# are essentially broken (GCN/SAGE aggregation over empty neighbourhoods).
+# ─────────────────────────────────────────────────────────────────────────────
+
+BETH_SUBGRAPH_QUERY = """
+MATCH (target:Process {processId: $pid})
+OPTIONAL MATCH (target)-[:CHILD_OF*0..2]-(neighbor:Process)
+WITH collect(DISTINCT neighbor) + collect(DISTINCT target) AS all_nodes
+UNWIND all_nodes AS n
+WITH collect(DISTINCT n) AS nodes
+UNWIND nodes AS n
+
+OPTIONAL MATCH (n)-[:EMITS]->(e)
+WITH nodes, n,
+     count(DISTINCT e)                                                    AS event_count,
+     coalesce(sum(CASE WHEN e.sus  = 1 THEN 1 ELSE 0 END), 0)          AS sus_score,
+     coalesce(sum(CASE WHEN e.evil = 1 THEN 1 ELSE 0 END), 0)          AS evil_score
+
+RETURN
+    id(n)                                                                  AS neo4j_id,
+    n.processId                                                            AS processId,
+    CASE WHEN n.userId = '0' THEN 1.0 ELSE 0.0 END                       AS is_root,
+    toFloat(event_count)                                                   AS event_count,
+    toFloat(sus_score)  / CASE WHEN event_count > 0
+                                THEN toFloat(event_count) ELSE 1.0 END   AS sus_ratio,
+    toFloat(evil_score) / CASE WHEN event_count > 0
+                                THEN toFloat(event_count) ELSE 1.0 END   AS evil_ratio,
+    0.0 AS net_ratio,
+    0.0 AS c2_event_count,
+    0.0 AS file_write_count,
+    0.0 AS inject_count
+"""
+
+BETH_SUBGRAPH_EDGES_QUERY = """
+MATCH (target:Process {processId: $pid})
+OPTIONAL MATCH (target)-[:CHILD_OF*0..2]-(neighbor:Process)
+WITH collect(DISTINCT neighbor) + collect(DISTINCT target) AS all_nodes
+UNWIND all_nodes AS n
+WITH collect(DISTINCT n) AS nodes
+MATCH (a)-[:CHILD_OF]->(b)
+WHERE a IN nodes AND b IN nodes
+RETURN id(a) AS source, id(b) AS target
+"""
+
+DARPA_SUBGRAPH_QUERY = """
+MATCH (target:Process {uuid: $uuid})
+OPTIONAL MATCH (target)-[:SPAWNED*0..2]-(neighbor:Process)
+WITH collect(DISTINCT neighbor) + collect(DISTINCT target) AS all_nodes
+UNWIND all_nodes AS n
+WITH collect(DISTINCT n) AS nodes
+UNWIND nodes AS n
+
+RETURN
+    id(n)                                                                  AS neo4j_id,
+    n.uuid                                                                 AS uuid,
+    CASE WHEN n.userId IN ['0', 0] THEN 1.0 ELSE 0.0 END                 AS is_root,
+    1.0                                                                    AS event_count,
+    0.0 AS sus_ratio,
+    0.0 AS evil_ratio,
+    0.0 AS net_ratio,
+    0.0 AS c2_event_count,
+    0.0 AS file_write_count,
+    0.0 AS inject_count
+"""
+
+DARPA_SUBGRAPH_EDGES_QUERY = """
+MATCH (target:Process {uuid: $uuid})
+OPTIONAL MATCH (target)-[:SPAWNED*0..2]-(neighbor:Process)
+WITH collect(DISTINCT neighbor) + collect(DISTINCT target) AS all_nodes
+UNWIND all_nodes AS n
+WITH collect(DISTINCT n) AS nodes
+MATCH (a)-[:SPAWNED]->(b)
+WHERE a IN nodes AND b IN nodes
+RETURN id(a) AS source, id(b) AS target
+"""
+
+
+def _get_subgraph(dataset_tag: str, identifier: dict, scaler,
+                  device: torch.device) -> tuple:
+    """
+    Query k-hop neighbourhood from Neo4j and return (x_batch, edge_index, target_idx).
+
+    x_batch    : (N, 9) scaled feature tensor for all nodes in subgraph
+    edge_index : (2, E) edge tensor
+    target_idx : int — index of the target node in x_batch
+
+    Falls back to single-node self-loop if no neighbours found.
+    """
+    if dataset_tag == "beth":
+        pid = identifier.get("pid")
+        params = {"pid": pid}
+        node_rows = db_router.query("beth", BETH_SUBGRAPH_QUERY, params)
+        edge_rows = db_router.query("beth", BETH_SUBGRAPH_EDGES_QUERY, params)
+        id_key = "processId"
+        match_val = pid
+    else:
+        uuid_val = identifier.get("uuid")
+        params = {"uuid": uuid_val}
+        node_rows = db_router.query("darpa", DARPA_SUBGRAPH_QUERY, params)
+        edge_rows = db_router.query("darpa", DARPA_SUBGRAPH_EDGES_QUERY, params)
+        id_key = "uuid"
+        match_val = uuid_val
+
+    if not node_rows:
+        return None, None, None
+
+    # Build node features and mapping
+    neo4j_to_idx = {}
+    features_list = []
+    target_idx = 0
+
+    for i, r in enumerate(node_rows):
+        neo4j_to_idx[r["neo4j_id"]] = i
+        ec = max(float(r.get("event_count") or 1), 1.0)
+        feats = [
+            float(r.get("is_root") or 0),
+            ec,
+            float(r.get("sus_ratio") or 0),
+            float(r.get("evil_ratio") or 0),
+            5.0,  # bias constant
+            float(r.get("net_ratio") or 0),
+            float(r.get("c2_event_count") or 0),
+            float(r.get("file_write_count") or 0),
+            float(r.get("inject_count") or 0),
+        ]
+        features_list.append(feats)
+        if r.get(id_key) == match_val:
+            target_idx = i
+
+    # Scale features
+    x_np = scaler.transform(
+        np.array(features_list, dtype=np.float32)
+    )
+    x_batch = torch.tensor(x_np, dtype=torch.float32).to(device)
+
+    # Build edge index
+    src_list, dst_list = [], []
+    if edge_rows:
+        for e in edge_rows:
+            s = neo4j_to_idx.get(e["source"])
+            t = neo4j_to_idx.get(e["target"])
+            if s is not None and t is not None:
+                src_list.append(s)
+                dst_list.append(t)
+
+    if not src_list:
+        # Fallback: self-loops for all nodes
+        for i in range(len(features_list)):
+            src_list.append(i)
+            dst_list.append(i)
+
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long).to(device)
+
+    return x_batch, edge_index, target_idx
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RAW-SCORE CONVERTERS
@@ -74,20 +231,33 @@ def score_iforest(x_scaled: np.ndarray, model) -> float:
 
 
 def score_graphcl(x_scaled: np.ndarray, model: GraphCL,
-                  mean_embed: torch.Tensor, device: torch.device) -> float:
+                  mean_embed: torch.Tensor, device: torch.device,
+                  x_batch: torch.Tensor = None,
+                  edge_index: torch.Tensor = None,
+                  target_idx: int = 0) -> float:
     """
     GraphCL: cosine distance from mean benign embedding.
-    Single-node self-loop graph for inference (no full graph context at test
-    time — the embedding is a fallback approximation).
+    If x_batch and edge_index are provided, use full subgraph context.
+    Otherwise fall back to single-node self-loop (degraded mode).
     """
     model.eval()
-    x_t  = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0).to(device)
-    ei   = torch.tensor([[0], [0]], dtype=torch.long).to(device)
-    with torch.no_grad():
-        emb        = model.encode(x_t, ei)[0]
-        cosine_sim = torch.nn.functional.cosine_similarity(
-            emb.unsqueeze(0), mean_embed.to(device).unsqueeze(0)
-        ).item()
+    if x_batch is not None and edge_index is not None:
+        # Subgraph-aware: run GCN on real neighbourhood
+        with torch.no_grad():
+            all_emb = model.encode(x_batch, edge_index)
+            emb = all_emb[target_idx]
+            cosine_sim = torch.nn.functional.cosine_similarity(
+                emb.unsqueeze(0), mean_embed.to(device).unsqueeze(0)
+            ).item()
+    else:
+        # Fallback: single-node self-loop
+        x_t  = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+        ei   = torch.tensor([[0], [0]], dtype=torch.long).to(device)
+        with torch.no_grad():
+            emb        = model.encode(x_t, ei)[0]
+            cosine_sim = torch.nn.functional.cosine_similarity(
+                emb.unsqueeze(0), mean_embed.to(device).unsqueeze(0)
+            ).item()
     return float(np.clip((1.0 - cosine_sim) / 2.0, 0.0, 1.0))
 
 
@@ -101,16 +271,45 @@ def score_deepsad(x_scaled: np.ndarray, model: DeepSAD,
     return _sigmoid(dist, k=2.0, centre=1.0)
 
 
-def _autoencoder_score(x_scaled: np.ndarray, model, device: torch.device) -> float:
+def _autoencoder_score(x_scaled: np.ndarray, model, device: torch.device,
+                       x_batch: torch.Tensor = None,
+                       edge_index: torch.Tensor = None,
+                       target_idx: int = 0,
+                       use_edge_attribution: bool = False) -> float:
     """
     Generic reconstruction-error scorer for MAGIC, FLASH, ORTHRUS.
-    Passes a single-node self-loop graph (inference approximation).
+    If x_batch and edge_index are provided, use full subgraph context.
+    Otherwise fall back to single-node self-loop (degraded mode).
+
+    For ORTHRUS with use_edge_attribution=True and real edges:
+    final_score = 0.7 * node_recon_error + 0.3 * mean_edge_anomaly
     """
     model.eval()
-    x_t = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0).to(device)
-    ei  = torch.tensor([[0], [0]], dtype=torch.long).to(device)
-    with torch.no_grad():
-        raw = model.anomaly_score(x_t, ei)[0].item()
+    if x_batch is not None and edge_index is not None:
+        # Subgraph-aware: run GNN on real neighbourhood
+        with torch.no_grad():
+            raw = model.anomaly_score(x_batch, edge_index)[target_idx].item()
+
+            # P4: ORTHRUS edge attribution
+            if use_edge_attribution and hasattr(model, 'score_edges') \
+                    and edge_index.size(1) > 0:
+                try:
+                    z = model.encode(x_batch, edge_index)
+                    e_scores = model.score_edges(z, edge_index)
+                    mean_edge = e_scores.mean().item() if e_scores.numel() > 0 else 0.0
+                    # Combine: 70% node recon error + 30% edge anomaly
+                    combined = 0.7 * raw + 0.3 * mean_edge
+                    return _sigmoid(combined, k=2.0, centre=0.5)
+                except Exception:
+                    pass  # fall through to standard scoring
+
+    else:
+        # Fallback: single-node self-loop
+        x_t = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+        ei  = torch.tensor([[0], [0]], dtype=torch.long).to(device)
+        with torch.no_grad():
+            raw = model.anomaly_score(x_t, ei)[0].item()
+
     return _sigmoid(raw, k=2.0, centre=0.5)
 
 
@@ -298,7 +497,7 @@ class SequenceScorer:
         if precomputed:
             print(f"[Tool: SequenceScorer] Using precomputed features "
                   f"(dataset={dataset_tag}, process={identifier.get('process_name','?')})")
-            return self._score_from_precomputed(precomputed, dataset_tag)
+            return self._score_from_precomputed(precomputed, dataset_tag, identifier)
 
         # ── Standard Neo4j path ───────────────────────────────────────────────
         if dataset_tag == "beth":
@@ -307,7 +506,8 @@ class SequenceScorer:
 
     # ── precomputed features path (NEW) ───────────────────────────────────────
 
-    def _score_from_precomputed(self, features: dict, dataset_tag: str) -> str:
+    def _score_from_precomputed(self, features: dict, dataset_tag: str,
+                                identifier: dict = None) -> str:
         """
         Score directly from a pre-aggregated 9-feature dict.
         Used by json_file_runner.py for test/val data not in Neo4j.
@@ -315,6 +515,10 @@ class SequenceScorer:
         Expected keys: is_root, event_count, sus_ratio, evil_ratio,
                        net_ratio, c2_event_count, file_write_count, inject_count
         Missing keys default to 0 safely.
+
+        P0 FIX: Also attempts subgraph query if identifier is provided and
+        ephemeral graph is loaded in Neo4j (json_file_runner loads test data
+        temporarily). This gives GNN models real graph context.
         """
         ec = max(float(features.get("event_count", 1)), 1.0)
 
@@ -332,12 +536,25 @@ class SequenceScorer:
 
         m = self._m
 
+        # P0: Try subgraph query for GNN context (works when ephemeral graph is loaded)
+        x_batch, edge_index, target_idx = None, None, 0
+        if identifier:
+            try:
+                scaler = m.beth_scaler if dataset_tag == "beth" else m.darpa_scaler
+                x_batch, edge_index, target_idx = _get_subgraph(
+                    dataset_tag, identifier, scaler, m.device
+                )
+            except Exception:
+                pass  # fall back to single-node mode
+
         if dataset_tag == "beth":
             x_scaled = m.beth_scaler.transform(
                 np.array(feats, dtype=np.float32).reshape(1, -1)
             ).flatten()
             s_gcl = score_graphcl(x_scaled, m.beth_graphcl,
-                                   m.beth_graphcl_mean, m.device)
+                                   m.beth_graphcl_mean, m.device,
+                                   x_batch=x_batch, edge_index=edge_index,
+                                   target_idx=target_idx or 0)
             s_if  = score_iforest(x_scaled, m.beth_iforest)
             s_sad = score_deepsad(x_scaled, m.beth_deepsad, m.device)
             score = (BETH_W["graphcl"] * s_gcl
@@ -353,9 +570,16 @@ class SequenceScorer:
             x_scaled = m.darpa_scaler.transform(
                 np.array(feats, dtype=np.float32).reshape(1, -1)
             ).flatten()
-            s_magic   = _autoencoder_score(x_scaled, m.darpa_magic,   m.device)
-            s_flash   = _autoencoder_score(x_scaled, m.darpa_flash,   m.device)
-            s_orthrus = _autoencoder_score(x_scaled, m.darpa_orthrus, m.device)
+            s_magic   = _autoencoder_score(x_scaled, m.darpa_magic, m.device,
+                                           x_batch=x_batch, edge_index=edge_index,
+                                           target_idx=target_idx or 0)
+            s_flash   = _autoencoder_score(x_scaled, m.darpa_flash, m.device,
+                                           x_batch=x_batch, edge_index=edge_index,
+                                           target_idx=target_idx or 0)
+            s_orthrus = _autoencoder_score(x_scaled, m.darpa_orthrus, m.device,
+                                           x_batch=x_batch, edge_index=edge_index,
+                                           target_idx=target_idx or 0,
+                                           use_edge_attribution=True)
             score = (DARPA_W["magic"]   * s_magic
                    + DARPA_W["flash"]   * s_flash
                    + DARPA_W["orthrus"] * s_orthrus)
@@ -409,8 +633,15 @@ class SequenceScorer:
             np.array(feats, dtype=np.float32).reshape(1, -1)
         ).flatten()
 
+        # P0: Get subgraph for GNN-based models
+        x_batch, edge_index, target_idx = _get_subgraph(
+            "beth", identifier, m.beth_scaler, m.device
+        )
+
         s_gcl = score_graphcl(x_scaled, m.beth_graphcl,
-                               m.beth_graphcl_mean, m.device)
+                               m.beth_graphcl_mean, m.device,
+                               x_batch=x_batch, edge_index=edge_index,
+                               target_idx=target_idx or 0)
         s_if  = score_iforest(x_scaled, m.beth_iforest)
         s_sad = score_deepsad(x_scaled, m.beth_deepsad, m.device)
 
@@ -460,9 +691,22 @@ class SequenceScorer:
             np.array(feats, dtype=np.float32).reshape(1, -1)
         ).flatten()
 
-        s_magic   = _autoencoder_score(x_scaled, m.darpa_magic,   m.device)
-        s_flash   = _autoencoder_score(x_scaled, m.darpa_flash,   m.device)
-        s_orthrus = _autoencoder_score(x_scaled, m.darpa_orthrus, m.device)
+        # P0: Get subgraph for GNN-based models
+        x_batch, edge_index, target_idx = _get_subgraph(
+            "darpa", identifier, m.darpa_scaler, m.device
+        )
+
+        s_magic   = _autoencoder_score(x_scaled, m.darpa_magic, m.device,
+                                       x_batch=x_batch, edge_index=edge_index,
+                                       target_idx=target_idx or 0)
+        s_flash   = _autoencoder_score(x_scaled, m.darpa_flash, m.device,
+                                       x_batch=x_batch, edge_index=edge_index,
+                                       target_idx=target_idx or 0)
+        # P4: ORTHRUS with edge attribution
+        s_orthrus = _autoencoder_score(x_scaled, m.darpa_orthrus, m.device,
+                                       x_batch=x_batch, edge_index=edge_index,
+                                       target_idx=target_idx or 0,
+                                       use_edge_attribution=True)
 
         score = (DARPA_W["magic"]   * s_magic
                + DARPA_W["flash"]   * s_flash
